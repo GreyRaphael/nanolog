@@ -291,10 +291,10 @@ class RingBuffer : public BufferBase {
    public:
     struct alignas(64) Item {
         Item()
-            : flag{ATOMIC_FLAG_INIT}, written(0), logline(LogLevel::INFO, nullptr, nullptr, 0) {
+            : written(0), logline(LogLevel::INFO, nullptr, nullptr, 0) {
         }
 
-        std::atomic_flag flag;
+        std::atomic_flag flag{};
         char written;
         char padding[256 - sizeof(std::atomic_flag) - sizeof(char) - sizeof(NanoLogLine)];
         NanoLogLine logline;
@@ -400,7 +400,7 @@ class QueueBuffer : public BufferBase {
     QueueBuffer(QueueBuffer const &) = delete;
     QueueBuffer &operator=(QueueBuffer const &) = delete;
 
-    QueueBuffer() : m_current_read_buffer{nullptr}, m_write_index(0), m_flag{ATOMIC_FLAG_INIT}, m_read_index(0) {
+    QueueBuffer() : m_current_read_buffer{nullptr}, m_write_index(0), m_read_index(0) {
         setup_next_write_buffer();
     }
 
@@ -458,7 +458,7 @@ class QueueBuffer : public BufferBase {
     std::atomic<Buffer *> m_current_write_buffer;
     Buffer *m_current_read_buffer;
     std::atomic<unsigned int> m_write_index;
-    std::atomic_flag m_flag;
+    std::atomic_flag m_flag{};
     unsigned int m_read_index;
 };
 
@@ -492,7 +492,7 @@ class FileWriter {
         log_file_name.append(".");
         log_file_name.append(std::to_string(++m_file_number));
         log_file_name.append(".txt");
-        m_os->open(log_file_name, std::ofstream::out | std::ofstream::trunc);
+        m_os->open(log_file_name, std::ofstream::out | std::ofstream::app);
     }
 
    private:
