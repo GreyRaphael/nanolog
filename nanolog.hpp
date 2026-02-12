@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iosfwd>
@@ -464,16 +465,25 @@ class QueueBuffer : public BufferBase {
 
 class FileWriter {
    public:
-    FileWriter(std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb)
-        : m_log_file_roll_size_bytes(log_file_roll_size_mb * 1024 * 1024), m_name(log_directory + log_file_name) {
+    FileWriter(std::string const &log_directory,
+               std::string const &log_file_name,
+               uint32_t log_file_roll_size_mb,
+               uint32_t max_files)  // 新增：最大保留文件数
+        : m_log_file_roll_size_bytes(log_file_roll_size_mb * 1024 * 1024),
+          m_base_path(std::filesystem::path(log_directory) / log_file_name),
+          m_max_files(max_files) {
+        // 确保目录存在
+        std::filesystem::create_directories(m_base_path.parent_path());
         roll_file();
     }
 
     void write(NanoLogLine &logline) {
+        // 使用 tellp() 可能会有性能开销，但在滚动逻辑中是必要的
         auto pos = m_os->tellp();
         logline.stringify(*m_os);
-        m_bytes_written += m_os->tellp() - pos;
-        if (m_bytes_written > m_log_file_roll_size_bytes) {
+        m_bytes_written += (m_os->tellp() - pos);
+
+        if (m_bytes_written >= m_log_file_roll_size_bytes) {
             roll_file();
         }
     }
@@ -485,33 +495,38 @@ class FileWriter {
             m_os->close();
         }
 
+        // 1. 计算下一个文件编号 (1 到 m_max_files 循环)
+        // 逻辑：Log.1.txt -> Log.2.txt -> ... -> Log.N.txt -> 回到 Log.1.txt
+        m_file_number = (m_file_number % m_max_files) + 1;
+
+        // 2. 构造文件名
+        std::string current_file = m_base_path.string() + "." + std::to_string(m_file_number) + ".txt";
+
+        // 3. 如果文件已存在，先删除（或直接截断），确保是新文件
+        std::filesystem::remove(current_file);
+
         m_bytes_written = 0;
-        m_os.reset(new std::ofstream());
-        // TODO Optimize this part. Does it even matter ?
-        std::string log_file_name = m_name;
-        log_file_name.append(".");
-        log_file_name.append(std::to_string(++m_file_number));
-        log_file_name.append(".txt");
-        m_os->open(log_file_name, std::ofstream::out | std::ofstream::app);
+        m_os = std::make_unique<std::ofstream>(current_file, std::ofstream::out | std::ofstream::trunc);
     }
 
    private:
     uint32_t m_file_number = 0;
     std::streamoff m_bytes_written = 0;
     uint32_t const m_log_file_roll_size_bytes;
-    std::string const m_name;
+    uint32_t const m_max_files;
+    std::filesystem::path const m_base_path;
     std::unique_ptr<std::ofstream> m_os;
 };
 
 class NanoLogger {
    public:
-    NanoLogger(NonGuaranteedLogger ngl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb)
-        : m_state(State::INIT), m_buffer_base(new RingBuffer(std::max(1u, ngl.ring_buffer_size_mb) * 1024 * 4)), m_file_writer(log_directory, log_file_name, std::max(1u, log_file_roll_size_mb)), m_thread(&NanoLogger::pop, this) {
+    NanoLogger(NonGuaranteedLogger ngl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb, uint32_t max_files)
+        : m_state(State::INIT), m_buffer_base(new RingBuffer(std::max(1u, ngl.ring_buffer_size_mb) * 1024 * 4)), m_file_writer(log_directory, log_file_name, std::max(1u, log_file_roll_size_mb), max_files), m_thread(&NanoLogger::pop, this) {
         m_state.store(State::READY, std::memory_order_release);
     }
 
-    NanoLogger(GuaranteedLogger gl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb)
-        : m_state(State::INIT), m_buffer_base(new QueueBuffer()), m_file_writer(log_directory, log_file_name, std::max(1u, log_file_roll_size_mb)), m_thread(&NanoLogger::pop, this) {
+    NanoLogger(GuaranteedLogger gl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb, uint32_t max_files)
+        : m_state(State::INIT), m_buffer_base(new QueueBuffer()), m_file_writer(log_directory, log_file_name, std::max(1u, log_file_roll_size_mb), max_files), m_thread(&NanoLogger::pop, this) {
         m_state.store(State::READY, std::memory_order_release);
     }
 
@@ -598,13 +613,13 @@ inline bool is_logged(LogLevel level) {
  */
 //	void initialize(GuaranteedLogger gl, std::string const & log_directory, std::string const & log_file_name, uint32_t log_file_roll_size_mb);
 //	void initialize(NonGuaranteedLogger ngl, std::string const & log_directory, std::string const & log_file_name, uint32_t log_file_roll_size_mb);
-inline void initialize(NonGuaranteedLogger ngl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb) {
-    nanologger.reset(new NanoLogger(ngl, log_directory, log_file_name, log_file_roll_size_mb));
+inline void initialize(NonGuaranteedLogger ngl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb, uint32_t max_files) {
+    nanologger.reset(new NanoLogger(ngl, log_directory, log_file_name, log_file_roll_size_mb, max_files));
     atomic_nanologger.store(nanologger.get(), std::memory_order_seq_cst);
 }
 
-inline void initialize(GuaranteedLogger gl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb) {
-    nanologger.reset(new NanoLogger(gl, log_directory, log_file_name, log_file_roll_size_mb));
+inline void initialize(GuaranteedLogger gl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb, uint32_t max_files) {
+    nanologger.reset(new NanoLogger(gl, log_directory, log_file_name, log_file_roll_size_mb, max_files));
     atomic_nanologger.store(nanologger.get(), std::memory_order_seq_cst);
 }
 }  // namespace nanolog
