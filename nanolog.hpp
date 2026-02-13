@@ -8,6 +8,7 @@
 #include <format>
 #include <fstream>
 #include <iosfwd>
+#include <iostream>
 #include <memory>
 #include <queue>
 #include <string>
@@ -470,23 +471,40 @@ class QueueBuffer : public BufferBase {
 
 class FileWriter {
    public:
+    // 文件模式构造函数
     FileWriter(std::string const &log_directory,
                std::string const &log_file_name,
                uint32_t log_file_roll_size_mb,
                uint32_t max_files)  // 新增：最大保留文件数
         : m_log_file_roll_size_bytes(log_file_roll_size_mb * 1024 * 1024),
           m_base_path(std::filesystem::path(log_directory) / log_file_name),
-          m_max_files(max_files) {
+          m_max_files(max_files),
+          m_is_stdout(false) {
         // 确保目录存在
         std::filesystem::create_directories(m_base_path.parent_path());
         roll_file();
     }
 
+    // 新增：std::cout 模式构造函数
+    FileWriter()
+        : m_log_file_roll_size_bytes(0),
+          m_max_files(0),
+          m_is_stdout(true) {
+        m_os_ptr = &std::cout;
+    }
+
     void write(NanoLogLine &logline) {
+        if (m_is_stdout) {
+            logline.stringify(*m_os_ptr);
+            m_os_ptr->flush();  // 实时刷新屏幕输出
+            return;
+        }
+
+        // 文件模式逻辑
         // 使用 tellp() 可能会有性能开销，但在滚动逻辑中是必要的
-        auto pos = m_os->tellp();
-        logline.stringify(*m_os);
-        m_bytes_written += (m_os->tellp() - pos);
+        auto pos = m_os_ptr->tellp();
+        logline.stringify(*m_os_ptr);
+        m_bytes_written += (m_os_ptr->tellp() - pos);
 
         if (m_bytes_written >= m_log_file_roll_size_bytes) {
             roll_file();
@@ -495,9 +513,9 @@ class FileWriter {
 
    private:
     void roll_file() {
-        if (m_os) {
-            m_os->flush();
-            m_os->close();
+        if (m_file_stream && m_file_stream->is_open()) {
+            m_file_stream->flush();
+            m_file_stream->close();
         }
 
         // 1. 计算下一个文件编号 (1 到 m_max_files 循环)
@@ -507,20 +525,22 @@ class FileWriter {
         // 2. 构造文件名
         std::string current_file = m_base_path.string() + "." + std::to_string(m_file_number) + ".txt";
 
-        // 3. 如果文件已存在，先删除（或直接截断），确保是新文件
-        std::filesystem::remove(current_file);
-
+        // 重新打开文件流
+        m_file_stream = std::make_unique<std::ofstream>(current_file, std::ofstream::out | std::ofstream::trunc);
+        m_os_ptr = m_file_stream.get();  // 更新基类指针指向
         m_bytes_written = 0;
-        m_os = std::make_unique<std::ofstream>(current_file, std::ofstream::out | std::ofstream::trunc);
     }
 
    private:
+    bool const m_is_stdout;
     uint32_t m_file_number = 0;
     std::streamoff m_bytes_written = 0;
     uint32_t const m_log_file_roll_size_bytes;
     uint32_t const m_max_files;
     std::filesystem::path const m_base_path;
-    std::unique_ptr<std::ofstream> m_os;
+
+    std::ostream *m_os_ptr = nullptr;              // 统一的操作指针
+    std::unique_ptr<std::ofstream> m_file_stream;  // 仅在文件模式下持有所有权
 };
 
 class NanoLogger {
@@ -532,6 +552,11 @@ class NanoLogger {
 
     NanoLogger(GuaranteedLogger gl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb, uint32_t max_files)
         : m_state(State::INIT), m_buffer_base(new QueueBuffer()), m_file_writer(log_directory, log_file_name, std::max(1u, log_file_roll_size_mb), max_files), m_thread(&NanoLogger::pop, this) {
+        m_state.store(State::READY, std::memory_order_release);
+    }
+
+    NanoLogger()
+        : m_state(State::INIT), m_buffer_base(new QueueBuffer()), m_thread(&NanoLogger::pop, this) {
         m_state.store(State::READY, std::memory_order_release);
     }
 
@@ -625,6 +650,11 @@ inline void initialize(NonGuaranteedLogger ngl, std::string const &log_directory
 
 inline void initialize(GuaranteedLogger gl, std::string const &log_directory, std::string const &log_file_name, uint32_t log_file_roll_size_mb, uint32_t max_files) {
     nanologger.reset(new NanoLogger(gl, log_directory, log_file_name, log_file_roll_size_mb, max_files));
+    atomic_nanologger.store(nanologger.get(), std::memory_order_seq_cst);
+}
+
+inline void initialize() {
+    nanologger.reset(new NanoLogger());
     atomic_nanologger.store(nanologger.get(), std::memory_order_seq_cst);
 }
 }  // namespace nanolog
