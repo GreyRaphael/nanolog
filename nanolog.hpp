@@ -5,8 +5,8 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <format>
 #include <fstream>
-#include <iomanip>
 #include <iosfwd>
 #include <memory>
 #include <queue>
@@ -52,19 +52,24 @@ struct GuaranteedLogger {};
 namespace {
 
 /* Returns microseconds since epoch */
+/* 返回自 Epoch 以来的纳秒数 (Nanoseconds) */
 uint64_t timestamp_now() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 }
 
-/* I want [2016-10-13 00:01:23.528514] */
-void format_timestamp(std::ostream &os, uint64_t timestamp) {
-    auto n = std::chrono::system_clock::now();
-    auto m = n.time_since_epoch();
-    auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(m).count();
-    // auto const msecs = diff % 1000;
+/* 格式化传入的纳秒时间戳 */
+void format_timestamp(std::ostream &os, uint64_t timestamp_ns) {
+    // 1. 先将 uint64_t 转换为纳秒 duration
+    auto dur = std::chrono::nanoseconds{timestamp_ns};
 
-    std::time_t t = std::chrono::system_clock::to_time_t(n);
-    os << '[' << std::put_time(std::localtime(&t), "%Y-%m-%d %H.%M.%S") << "." << diff << ']';
+    // 2. 使用 sys_time<nanoseconds>，它是 C++20 中专门处理纳秒系统时间的别名
+    // std::chrono::sys_time<std::chrono::nanoseconds> tp{dur};
+    // 如果你的编译器版本略低，可以使用 std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds>
+    std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds> tp{dur};
+
+    // %F 等同于 %Y-%m-%d
+    // %T 等同于 %H:%M:%S（在 ns 精度下，它会自动显示 9 位小数）
+    os << std::format("[{:%F %T}]", tp);
 }
 
 std::thread::id this_thread_id() {
