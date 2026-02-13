@@ -20,6 +20,17 @@ enum class LogLevel : uint8_t { INFO,
                                 WARN,
                                 CRIT };
 
+// 跨平台获取文件名（仅保留最后一部分）
+// 使用 inline 确保安全
+inline const char *get_file_name(const char *path) {
+    if (!path) return nullptr;
+    const char *last_slash = nullptr;
+    for (const char *p = path; *p; ++p) {
+        if (*p == '/' || *p == '\\') last_slash = p;
+    }
+    return last_slash ? last_slash + 1 : path;
+}
+
 /*
  * Non guaranteed logging. Uses a ring buffer to hold log lines.
  * When the ring gets full, the previous log line in the slot will be dropped.
@@ -36,8 +47,7 @@ struct NonGuaranteedLogger {
 /*
  * Provides a guarantee log lines will not be dropped.
  */
-struct GuaranteedLogger {
-};
+struct GuaranteedLogger {};
 
 namespace {
 
@@ -102,7 +112,7 @@ class NanoLogLine {
    public:
     typedef std::tuple<char, uint32_t, uint64_t, int32_t, int64_t, double, const char *, char *> SupportedTypes;
     NanoLogLine(LogLevel level, char const *file, char const *function, uint32_t line) : m_bytes_used(0), m_buffer_size(sizeof(m_stack_buffer)) {
-        encode0(timestamp_now(), this_thread_id(), file, function, line, level);
+        encode0(timestamp_now(), this_thread_id(), get_file_name(file), function, line, level);
     }
 
     ~NanoLogLine() = default;
