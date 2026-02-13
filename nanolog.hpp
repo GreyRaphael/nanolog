@@ -138,11 +138,11 @@ class NanoLogLine {
         format_timestamp(os, timestamp);
         os << '[' << to_string(loglevel) << "][" << threadid << "][" << file << ':' << function << ':' << line << "] ";
 
+        // recursive invoke
         stringify(os, b, end);
-        os << '\n';  // 使用 \n 代替 endl 减少强制刷新次数
 
-        if (loglevel >= LogLevel::CRIT)
-            os.flush();
+        os << '\n';  // 使用 \n 代替 endl 减少强制刷新次数
+        if (loglevel >= LogLevel::CRIT) os.flush();
     }
 
     template <typename Arg>
