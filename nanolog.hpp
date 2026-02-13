@@ -82,26 +82,20 @@ struct TupleIndex;
 
 template <typename T, typename... Types>
 struct TupleIndex<T, std::tuple<T, Types...>> {
-    static constexpr const std::size_t value = 0;
+    static constexpr std::size_t value = 0;
 };
 
 template <typename T, typename U, typename... Types>
 struct TupleIndex<T, std::tuple<U, Types...>> {
-    static constexpr const std::size_t value = 1 + TupleIndex<T, std::tuple<Types...>>::value;
+    static constexpr std::size_t value = 1 + TupleIndex<T, std::tuple<Types...>>::value;
 };
 
 template <typename T>
-struct is_c_string;
+concept is_c_string_v = std::is_same_v<char *, std::decay_t<T>> || std::is_same_v<const char *, std::decay_t<T>>;
 
-template <typename T>
-struct is_c_string : std::integral_constant<bool, std::is_same_v<char *, std::decay_t<T>> || std::is_same_v<const char *, std::decay_t<T>>> {
-};
-
-template <typename T>
-constexpr bool is_c_string_v = is_c_string<T>::value;
 }  // anonymous namespace
 
-inline char const *to_string(LogLevel loglevel) {
+inline const char *to_string(LogLevel loglevel) {
     switch (loglevel) {
         case LogLevel::INFO:
             return "INFO";
@@ -109,8 +103,9 @@ inline char const *to_string(LogLevel loglevel) {
             return "WARN";
         case LogLevel::CRIT:
             return "CRIT";
+        default:
+            return "XXXX";
     }
-    return "XXXX";
 }
 
 class NanoLogLine {
@@ -121,9 +116,8 @@ class NanoLogLine {
     }
 
     ~NanoLogLine() = default;
-
-    NanoLogLine(NanoLogLine &&) = default;
-    NanoLogLine &operator=(NanoLogLine &&) = default;
+    NanoLogLine(NanoLogLine &&) noexcept = default;
+    NanoLogLine &operator=(NanoLogLine &&) noexcept = default;
 
     void stringify(std::ostream &os) {
         char *b = !m_heap_buffer ? m_stack_buffer : m_heap_buffer.get();
@@ -142,14 +136,10 @@ class NanoLogLine {
         b += sizeof(LogLevel);
 
         format_timestamp(os, timestamp);
-
-        os << '[' << to_string(loglevel) << ']'
-           << '[' << threadid << ']'
-           << '[' << file << ':' << function << ':' << line << "] ";
+        os << '[' << to_string(loglevel) << "][" << threadid << "][" << file << ':' << function << ':' << line << "] ";
 
         stringify(os, b, end);
-
-        os << std::endl;
+        os << '\n';  // 使用 \n 代替 endl 减少强制刷新次数
 
         if (loglevel >= LogLevel::CRIT)
             os.flush();
