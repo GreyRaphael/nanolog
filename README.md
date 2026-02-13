@@ -1,11 +1,29 @@
-# 一个header only的c++20 日志库
+# header-only c++20 cross-platform nanolog
 
-# 背景
-[NanoLog](https://github.com/Iyengar111/NanoLog)是一个非常小巧的log库，代码很少，不到一千行，速度比spdlog还快，应用上也能满足需求，我很喜欢。但是也存在一些不足，比如日志文件的数量没有限制，每次重启之后会从头开始写等等问题，还需要进一步完善。于是我新建了一个工程[nanolog](https://github.com/qicosmos/nanolog)，这个工程继承于nanolog，将原工程改成header only，并用了一些最新的特性来简化原来的代码。
+## features
+1. head-only, just use `nanolog.hpp`
+2. c++20 support
+3. cross-platform: Linux & Windows tested
+4. log file rotating
 
-# 快速示例
+Based on [NanoLog](https://github.com/Iyengar111/NanoLog) and [nanolog](https://github.com/qicosmos/nanolog)
 
-	#include "nanolog.hpp"
+## log
 
-	nanolog::initialize(nanolog::GuaranteedLogger(), "/tmp/", "nanolog", 1);
-	LOG_INFO << "Sample NanoLog: " << 1 << 2.5 << 'c';
+```bash
+log/
+	main.1.txt
+	main.2.txt
+	main.3.txt
+```
+
+```bash
+# main.1.txt sample
+[2026-02-13 03:07:53.815312800][INFO][140224859211584][main.cpp:main:11] hello37584
+[2026-02-13 03:07:53.815314200][INFO][140224859211584][main.cpp:main:11] hello37585
+[2026-02-13 03:07:53.815315300][INFO][140224859211584][main.cpp:main:11] hello37586
+[2026-02-13 03:07:53.815316400][INFO][140224859211584][main.cpp:main:11] hello37587
+[2026-02-13 03:07:53.815317600][INFO][140224859211584][main.cpp:main:11] hello37588
+[2026-02-13 03:07:53.815318700][INFO][140224859211584][main.cpp:main:11] hello37589
+[2026-02-13 03:07:53.815319800][INFO][140224859211584][main.cpp:main:11] hello37590
+```
