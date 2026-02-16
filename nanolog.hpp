@@ -233,28 +233,29 @@ class FileWriter {
 // --- 核心：TLS + SPSC ---
 class NanoLogger;
 using TLSSPSCQueue = SPSCVarQueueOPT<THREAD_QUEUE_SIZE>;
+inline std::atomic<NanoLogger *> atomic_logger{nullptr};
 
 class ThreadBuffer {
    public:
-    ThreadBuffer(NanoLogger *logger);
-    ~ThreadBuffer();
+    ThreadBuffer() { m_queue = std::make_shared<TLSSPSCQueue>(); }
+    ~ThreadBuffer();  // 见下方 NanoLogger 定义后的实现
 
     // Non-blocking push
     void push(const NanoLogLine &logline) {
+        if (!m_queue) return;
         size_t len = logline.bytes_used();
         // SPSC alloc 失败返回 nullptr，即队列满直接丢弃 (NonGuaranteed)
-        m_queue.tryPush(static_cast<uint16_t>(len), [&](TLSSPSCQueue::MsgHeader *header) {
+        m_queue->tryPush(static_cast<uint16_t>(len), [&](TLSSPSCQueue::MsgHeader *header) {
             // SPSC MsgHeader 之后是数据区
-            void *dest = reinterpret_cast<char *>(header) + sizeof(TLSSPSCQueue::MsgHeader);
+            char *dest = reinterpret_cast<char *>(header) + sizeof(TLSSPSCQueue::MsgHeader);
             std::memcpy(dest, logline.buffer(), len);
         });
     }
 
-    TLSSPSCQueue *get_queue() { return &m_queue; }
+    auto get_queue() { return m_queue; }
 
    private:
-    TLSSPSCQueue m_queue;
-    NanoLogger *m_logger;
+    std::shared_ptr<TLSSPSCQueue> m_queue;
 };
 
 class NanoLogger {
@@ -270,16 +271,21 @@ class NanoLogger {
     ~NanoLogger() {
         m_state.store(State::SHUTDOWN);
         if (m_thread.joinable()) m_thread.join();
+        // 线程停止后再置空全局指针，防止新线程在此时注册
+        atomic_logger.store(nullptr, std::memory_order_release);
     }
 
-    void register_buf(ThreadBuffer *tb) {
+    void register_buf(std::shared_ptr<TLSSPSCQueue> q) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_buffers.push_back(tb);
+        m_queues.push_back(std::move(q));
     }
 
-    void unregister_buf(ThreadBuffer *tb) {
+    void unregister_buf(const std::shared_ptr<TLSSPSCQueue> &q) {
+        // 这一块可以不实现
         std::lock_guard<std::mutex> lock(m_mutex);
-        std::erase(m_buffers, tb);
+        // 使用 std::erase 移除对应的 shared_ptr
+        // 即使移除了，正在执行 poll 的线程因为 snapshot 持有引用，依然安全
+        std::erase(m_queues, q);
     }
 
    private:
@@ -288,24 +294,23 @@ class NanoLogger {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
 
         while (m_state.load() == State::READY) poll(false);
-        poll(true);  // Drain
+        poll(true);  // 退出前最后一次清空
     }
 
     void poll(bool drain) {
         bool active = false;
         // 复制快照以减小锁粒度
-        std::vector<ThreadBuffer *> snapshot;
+        std::vector<std::shared_ptr<TLSSPSCQueue>> snapshot;
+
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            snapshot = m_buffers;
+            snapshot = m_queues;  // 拷贝 shared_ptr 增加引用计数，确保内存安全
         }
 
-        for (auto *tb : snapshot) {
-            auto *q = tb->get_queue();
+        for (auto &q : snapshot) {
             while (auto *header = q->front()) {
                 active = true;
                 char *data = reinterpret_cast<char *>(header) + sizeof(TLSSPSCQueue::MsgHeader);
-                // header->size 是总块大小，减去头部得到实际数据大小
                 m_writer.write(data, header->size - sizeof(TLSSPSCQueue::MsgHeader));
                 q->pop();
             }
@@ -320,23 +325,29 @@ class NanoLogger {
     FileWriter m_writer;
     std::thread m_thread;
     std::mutex m_mutex;
-    std::vector<ThreadBuffer *> m_buffers;
+    std::vector<std::shared_ptr<TLSSPSCQueue>> m_queues;
 };
 
-// 实现 ThreadBuffer 的注册逻辑
-inline ThreadBuffer::ThreadBuffer(NanoLogger *logger) : m_logger(logger) {
-    if (m_logger) m_logger->register_buf(this);
-}
+// --- 延迟实现的 ThreadBuffer 析构函数 ---
 inline ThreadBuffer::~ThreadBuffer() {
-    if (m_logger) m_logger->unregister_buf(this);
+    auto *logger = atomic_logger.load(std::memory_order_acquire);
+    if (logger) {
+        logger->unregister_buf(m_queue);
+    }
 }
 
-inline std::atomic<NanoLogger *> atomic_logger{nullptr};
+// --- 对外 API 接口 ---
 inline std::unique_ptr<NanoLogger> logger_holder;
 
-// 获取 TLS 实例
 inline ThreadBuffer &get_tls_buffer() {
-    static thread_local ThreadBuffer tb(atomic_logger.load(std::memory_order_relaxed));
+    static thread_local ThreadBuffer tb;
+    static thread_local bool registered = false;
+    auto *logger = atomic_logger.load(std::memory_order_acquire);
+
+    if (logger && !registered) {
+        logger->register_buf(tb.get_queue());
+        registered = true;
+    }
     return tb;
 }
 
