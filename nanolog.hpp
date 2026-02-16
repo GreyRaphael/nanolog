@@ -41,7 +41,7 @@ constexpr const char *get_file_name(const char *path) {
 // --- 日志行构建器 (栈上对象) ---
 class NanoLogLine {
    public:
-    using SupportedTypes = std::tuple<char, uint32_t, uint64_t, int32_t, int64_t, double, const char *, char *>;
+    using SupportedTypes = std::tuple<uint8_t, uint16_t, uint32_t, uint64_t, int8_t, int16_t, int32_t, int64_t, float, double, char, const char *, char *>;
 
     NanoLogLine(LogLevel level, const char *file, const char *func, uint32_t line) : m_bytes_used(0) {
         // 编码头部信息：时间戳, 线程ID, 文件, 函数, 行号, 级别
