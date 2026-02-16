@@ -160,13 +160,13 @@ class NanoLogLine {
     static char *decode_element(char *p, std::ostream &s) {
         using T = std::tuple_element_t<I, SupportedTypes>;
         if constexpr (std::is_same_v<T, char *> || std::is_same_v<T, const char *>) {
-            s << p;
+            s << p << ' ';
             return p + std::strlen(p) + 1;
         } else {
             T val;
             std::memcpy(&val, p, sizeof(T));
             // s << val;
-            s << std::format("{}", val);  // 解决double的精度问题
+            s << std::format("{} ", val);  // 解决double的精度问题
             return p + sizeof(T);
         }
     }
