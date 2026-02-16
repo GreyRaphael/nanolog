@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -43,238 +44,184 @@ namespace {
 
 // 跨平台获取文件名（仅保留最后一部分）
 // 使用 inline 确保安全
-inline const char *get_file_name(const char *path) {
+constexpr const char *get_file_name(const char *path) {
     if (!path) return nullptr;
-    const char *last_slash = nullptr;
-    for (const char *p = path; *p; ++p) {
-        if (*p == '/' || *p == '\\') last_slash = p;
-    }
-    return last_slash ? last_slash + 1 : path;
+    std::string_view sv(path);
+    auto pos = sv.find_last_of("\\/");
+    return (pos == std::string_view::npos) ? path : path + pos + 1;
 }
 
-/* Returns microseconds since epoch */
-/* 返回自 Epoch 以来的纳秒数 (Nanoseconds) */
-uint64_t timestamp_now() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-/* 格式化传入的纳秒时间戳 */
-void format_timestamp(std::ostream &os, uint64_t timestamp_ns) {
-    // 1. 先将 uint64_t 转换为纳秒 duration
-    auto dur = std::chrono::nanoseconds{timestamp_ns};
-
-    // 2. 使用 sys_time<nanoseconds>，它是 C++20 中专门处理纳秒系统时间的别名
-    // std::chrono::sys_time<std::chrono::nanoseconds> tp{dur};
-    // 如果你的编译器版本略低，可以使用 std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds>
-    std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds> tp{dur};
-
-    // UTC to local
-    auto local_tp = std::chrono::zoned_time{std::chrono::current_zone(), tp};
-
-    // %F 等同于 %Y-%m-%d
-    // %T 等同于 %H:%M:%S（在 ns 精度下，它会自动显示 9 位小数）
-    os << std::format("[{:%F %T}]", local_tp);
-}
-
-std::thread::id this_thread_id() {
-    static thread_local const std::thread::id id = std::this_thread::get_id();
+inline std::thread::id this_thread_id() {
+    thread_local const auto id = std::this_thread::get_id();
     return id;
 }
 
-template <typename T, typename Tuple>
-struct TupleIndex;
-
-template <typename T, typename... Types>
-struct TupleIndex<T, std::tuple<T, Types...>> {
-    static constexpr std::size_t value = 0;
-};
-
-template <typename T, typename U, typename... Types>
-struct TupleIndex<T, std::tuple<U, Types...>> {
-    static constexpr std::size_t value = 1 + TupleIndex<T, std::tuple<Types...>>::value;
-};
-
 template <typename T>
-concept is_c_string_v = std::is_same_v<char *, std::decay_t<T>> || std::is_same_v<const char *, std::decay_t<T>>;
+concept CString = std::same_as<std::decay_t<T>, char *> || std::same_as<std::decay_t<T>, const char *>;
 
 }  // anonymous namespace
 
-inline const char *to_string(LogLevel loglevel) {
-    switch (loglevel) {
-        case LogLevel::INFO:
-            return "INFO";
-        case LogLevel::WARN:
-            return "WARN";
-        case LogLevel::CRIT:
-            return "CRIT";
-        default:
-            return "XXXX";
-    }
-}
-
 class NanoLogLine {
    public:
-    typedef std::tuple<char, uint32_t, uint64_t, int32_t, int64_t, double, const char *, char *> SupportedTypes;
-    NanoLogLine(LogLevel level, char const *file, char const *function, uint32_t line) : m_bytes_used(0), m_buffer_size(sizeof(m_stack_buffer)) {
-        encode0(timestamp_now(), this_thread_id(), get_file_name(file), function, line, level);
+    using SupportedTypes = std::tuple<char, uint32_t, uint64_t, int32_t, int64_t, double, const char *, char *>;
+
+    NanoLogLine(LogLevel level, const char *file, const char *func, uint32_t line)
+        : m_bytes_used(0), m_buffer_size(sizeof(m_stack_buffer)) {
+        // 使用折叠表达式直接编码头部
+        encode_raw(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
+                   this_thread_id(), get_file_name(file), func, line, level);
     }
 
-    ~NanoLogLine() = default;
+    // 显式允许移动构造
     NanoLogLine(NanoLogLine &&) noexcept = default;
+    // 显式允许移动赋值
     NanoLogLine &operator=(NanoLogLine &&) noexcept = default;
+    // 显式禁用拷贝
+    NanoLogLine(const NanoLogLine &) = delete;
+    NanoLogLine &operator=(const NanoLogLine &) = delete;
 
-    void stringify(std::ostream &os) {
-        char *b = !m_heap_buffer ? m_stack_buffer : m_heap_buffer.get();
-        char const *const end = b + m_bytes_used;
-        uint64_t timestamp = *reinterpret_cast<uint64_t *>(b);
-        b += sizeof(uint64_t);
-        std::thread::id threadid = *reinterpret_cast<std::thread::id *>(b);
-        b += sizeof(std::thread::id);
-        const char *file = *reinterpret_cast<const char **>(b);
-        b += sizeof(const char *);
-        const char *function = *reinterpret_cast<const char **>(b);
-        b += sizeof(const char *);
-        uint32_t line = *reinterpret_cast<uint32_t *>(b);
-        b += sizeof(uint32_t);
-        LogLevel loglevel = *reinterpret_cast<LogLevel *>(b);
-        b += sizeof(LogLevel);
-
-        format_timestamp(os, timestamp);
-        os << '[' << to_string(loglevel) << "][" << threadid << "][" << file << ':' << function << ':' << line << "] ";
-
-        // recursive invoke
-        stringify(os, b, end);
-
-        os << '\n';  // 使用 \n 代替 endl 减少强制刷新次数
-        if (loglevel >= LogLevel::CRIT) os.flush();
-    }
-
-    template <typename Arg>
-    NanoLogLine &operator<<(Arg arg) {
-        if constexpr (std::is_arithmetic_v<Arg>) {
-            encode(arg, TupleIndex<Arg, SupportedTypes>::value);
-        } else if constexpr (is_c_string_v<Arg>) {
-            encode_c_string(arg);
-        }
-
+    // 算术类型重载
+    template <typename T>
+        requires std::is_arithmetic_v<T>
+    NanoLogLine &operator<<(T arg) {
+        encode_with_id<T>(arg);
         return *this;
     }
 
-   private:
-    char *buffer() {
-        return !m_heap_buffer ? &m_stack_buffer[m_bytes_used] : &(m_heap_buffer.get())[m_bytes_used];
+    // C 字符串重载
+    NanoLogLine &operator<<(CString auto arg) {
+        if (arg) encode_c_string(arg, std::strlen(arg));
+        return *this;
     }
 
-    void resize_buffer_if_needed(size_t additional_bytes) {
-        size_t const required_size = m_bytes_used + additional_bytes;
+    void stringify(std::ostream &os) {
+        char *b = !m_heap_buffer ? m_stack_buffer : m_heap_buffer.get();
+        char *end = b + m_bytes_used;
 
-        if (required_size <= m_buffer_size)
-            return;
+        // 1. 解码头部固定信息 (按照构造函数里的 encode_raw 顺序)
+        auto ts_ns = decode_raw<uint64_t>(b);
+        auto tid = decode_raw<std::thread::id>(b);
+        auto file = decode_raw<const char *>(b);
+        auto func = decode_raw<const char *>(b);
+        auto line = decode_raw<uint32_t>(b);
+        auto level = decode_raw<LogLevel>(b);
 
-        if (!m_heap_buffer) {
-            m_buffer_size = std::max(static_cast<size_t>(512), required_size);
-            m_heap_buffer.reset(new char[m_buffer_size]);
-            memcpy(m_heap_buffer.get(), m_stack_buffer, m_bytes_used);
-            return;
-        } else {
-            m_buffer_size = std::max(static_cast<size_t>(2 * m_buffer_size), required_size);
-            std::unique_ptr<char[]> new_heap_buffer(new char[m_buffer_size]);
-            memcpy(new_heap_buffer.get(), m_heap_buffer.get(), m_bytes_used);
-            m_heap_buffer.swap(new_heap_buffer);
+        // 2. 格式化输出头部 (C++20 风格)
+        auto tp = std::chrono::sys_time<std::chrono::nanoseconds>{std::chrono::nanoseconds{ts_ns}};
+        auto formatted_local_tp = std::format("[{:%F %T}]", std::chrono::zoned_time{std::chrono::current_zone(), tp});
+
+        os << formatted_local_tp << '[' << level2str(level) << "][" << tid << "][" << file << ':' << func << ':' << line << "] ";
+
+        // 3. 循环解码后续动态参数
+        while (b < end) {
+            uint8_t id = *reinterpret_cast<uint8_t *>(b++);
+            b = dispatch_decode(id, b, os);
         }
-    }
 
-    template <typename Arg>
-    void encode_c_string(Arg arg) {
-        if (arg != nullptr)
-            encode_c_string(arg, strlen(arg));
-    }
-
-    void encode_c_string(char const *arg, size_t length) {
-        if (length == 0)
-            return;
-
-        resize_buffer_if_needed(1 + length + 1);
-        char *b = buffer();
-        auto type_id = TupleIndex<char *, SupportedTypes>::value;
-        *reinterpret_cast<uint8_t *>(b++) = static_cast<uint8_t>(type_id);
-        memcpy(b, arg, length + 1);
-        m_bytes_used += 1 + length + 1;
-    }
-
-    template <typename... Arg>
-    void encode0(Arg... arg) {
-        ((*reinterpret_cast<Arg *>(buffer()) = arg, m_bytes_used += sizeof(Arg)), ...);
-    }
-
-    template <typename Arg>
-    void encode(Arg arg, uint8_t type_id) {
-        resize_buffer_if_needed(sizeof(Arg) + sizeof(uint8_t));
-        encode0(type_id, arg);
-    }
-
-    template <typename Arg>
-    char *decode(std::ostream &os, char *b, Arg *dummy) {
-        if constexpr (std::is_arithmetic_v<Arg>) {
-            Arg arg = *reinterpret_cast<Arg *>(b);
-            os << arg;
-            return b + sizeof(Arg);
-        } else if constexpr (std::is_same_v<const char *, Arg>) {
-            const char *s = *reinterpret_cast<const char **>(b);
-            os << s;
-            return b + sizeof(const char *);
-        } else if constexpr (std::is_same_v<char *, Arg>) {
-            while (*b != '\0') {
-                os << *b;
-                ++b;
-            }
-            return ++b;
-        }
-    }
-
-    template <size_t I>
-    using ele_type_p = std::tuple_element_t<I, SupportedTypes> *;
-
-    void stringify(std::ostream &os, char *start, char const *const end) {
-        if (start == end)
-            return;
-
-        int type_id = static_cast<int>(*start);
-        start++;
-
-        switch (type_id) {
-            case 0:
-                stringify(os, decode(os, start, static_cast<ele_type_p<0>>(nullptr)), end);
-                return;
-            case 1:
-                stringify(os, decode(os, start, static_cast<ele_type_p<1>>(nullptr)), end);
-                return;
-            case 2:
-                stringify(os, decode(os, start, static_cast<ele_type_p<2>>(nullptr)), end);
-                return;
-            case 3:
-                stringify(os, decode(os, start, static_cast<ele_type_p<3>>(nullptr)), end);
-                return;
-            case 4:
-                stringify(os, decode(os, start, static_cast<ele_type_p<4>>(nullptr)), end);
-                return;
-            case 5:
-                stringify(os, decode(os, start, static_cast<ele_type_p<5>>(nullptr)), end);
-                return;
-            case 6:
-                stringify(os, decode(os, start, static_cast<ele_type_p<6>>(nullptr)), end);
-                return;
-            case 7:
-                stringify(os, decode(os, start, static_cast<ele_type_p<7>>(nullptr)), end);
-                return;
-        }
+        os << '\n';
+        if (level >= LogLevel::CRIT) os.flush();
     }
 
    private:
+    // --- 保持不变的内存布局 ---
     size_t m_bytes_used;
     size_t m_buffer_size;
     std::unique_ptr<char[]> m_heap_buffer;
-    char m_stack_buffer[256 - 2 * sizeof(size_t) - sizeof(decltype(m_heap_buffer)) - 8 /* Reserved */];
+    char m_stack_buffer[256 - 2 * sizeof(size_t) - sizeof(decltype(m_heap_buffer)) - 8];
+
+    // --- 内部优化逻辑 ---
+
+    static constexpr const char *level2str(LogLevel l) {
+        switch (l) {
+            case LogLevel::INFO:
+                return "INFO";
+            case LogLevel::WARN:
+                return "WARN";
+            case LogLevel::CRIT:
+                return "CRIT";
+            default:
+                return "XXXX";
+        }
+    }
+
+    template <typename T>
+    static constexpr uint8_t get_type_id() {
+        return []<size_t... I>(std::index_sequence<I...>) {
+            uint8_t index = 0;
+            ((std::is_same_v<T, std::tuple_element_t<I, SupportedTypes>> ? index = I : 0), ...);
+            return index;
+        }(std::make_index_sequence<std::tuple_size_v<SupportedTypes>>{});
+    }
+
+    char *current_buffer_ptr() {
+        return !m_heap_buffer ? &m_stack_buffer[m_bytes_used] : &m_heap_buffer[m_bytes_used];
+    }
+
+    template <typename... Args>
+    void encode_raw(Args... args) {
+        // 使用折叠表达式一次性写入多个参数，无需 resize 检查（头部信息通常在 stack 范围内）
+        ((std::memcpy(current_buffer_ptr(), &args, sizeof(Args)), m_bytes_used += sizeof(Args)), ...);
+    }
+
+    template <typename T>
+    void encode_with_id(T arg) {
+        resize_buffer_if_needed(sizeof(T) + 1);
+        *reinterpret_cast<uint8_t *>(current_buffer_ptr()) = get_type_id<T>();
+        m_bytes_used += 1;
+        std::memcpy(current_buffer_ptr(), &arg, sizeof(T));
+        m_bytes_used += sizeof(T);
+    }
+
+    void encode_c_string(const char *arg, size_t len) {
+        resize_buffer_if_needed(len + 2);  // 1字节ID + 字符串内容 + \0
+        *reinterpret_cast<uint8_t *>(current_buffer_ptr()) = get_type_id<char *>();
+        m_bytes_used += 1;
+        std::memcpy(current_buffer_ptr(), arg, len + 1);
+        m_bytes_used += len + 1;
+    }
+
+    template <typename T>
+    T decode_raw(char *&p) {
+        T val;
+        std::memcpy(&val, p, sizeof(T));
+        p += sizeof(T);
+        return val;
+    }
+
+    // 使用函数指针表替代 switch-case
+    template <size_t I>
+    static char *decode_element(char *p, std::ostream &s) {
+        using T = std::tuple_element_t<I, SupportedTypes>;
+        if constexpr (std::is_same_v<T, char *> || std::is_same_v<T, const char *>) {
+            s << p;
+            return p + std::strlen(p) + 1;
+        } else {
+            T val;
+            std::memcpy(&val, p, sizeof(T));
+            s << val;
+            return p + sizeof(T);
+        }
+    }
+
+    char *dispatch_decode(uint8_t id, char *b, std::ostream &os) {
+        using DecodeFunc = char *(*)(char *, std::ostream &);
+
+        // 2. 使用一个辅助函数生成数组，避免在函数内部处理复杂的 lambda constexpr
+        static constexpr auto table = []<size_t... I>(std::index_sequence<I...>) {
+            return std::array<DecodeFunc, sizeof...(I)>{&decode_element<I>...};
+        }(std::make_index_sequence<std::tuple_size_v<SupportedTypes>>{});
+
+        return table[id](b, os);
+    }
+
+    void resize_buffer_if_needed(size_t additional) {
+        if (m_bytes_used + additional <= m_buffer_size) return;
+        size_t new_size = std::max(m_buffer_size * 2, m_bytes_used + additional);
+        auto *new_ptr = new char[new_size];
+        std::memcpy(new_ptr, !m_heap_buffer ? m_stack_buffer : m_heap_buffer.get(), m_bytes_used);
+        m_heap_buffer.reset(new_ptr);
+        m_buffer_size = new_size;
+    }
 };
 
 struct BufferBase {
@@ -560,6 +507,7 @@ class NanoLogger {
 
     NanoLogger()
         : m_state(State::INIT), m_buffer_base(new QueueBuffer()), m_thread(&NanoLogger::pop, this) {
+        // : m_state(State::INIT), m_buffer_base(new RingBuffer(8 * 1024 * 1024)), m_thread(&NanoLogger::pop, this) {
         m_state.store(State::READY, std::memory_order_release);
     }
 
@@ -629,10 +577,6 @@ inline void set_log_level(LogLevel level) {
 inline bool is_logged(LogLevel level) {
     return static_cast<unsigned int>(level) >= loglevel.load(std::memory_order_relaxed);
 }
-
-// void set_log_level(LogLevel level);
-//
-// bool is_logged(LogLevel level);
 
 /*
  * Ensure initialize() is called prior to any log statements.
