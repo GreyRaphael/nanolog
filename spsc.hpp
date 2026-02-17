@@ -11,7 +11,7 @@ template <typename T, typename Header>
 concept MsgReader = requires(T t, Header* h) { t(h); };
 
 template <uint32_t Bytes>
-class SPSCVarQueueOPT {
+class SPSCVarQueueStack {
    public:
     struct MsgHeader {
         uint16_t size;  // 整个消息的大小（含 header）
@@ -29,11 +29,11 @@ class SPSCVarQueueOPT {
     static constexpr size_t CacheLine = 64;
 #endif
 
-    SPSCVarQueueOPT() = default;
+    SPSCVarQueueStack() = default;
 
     // 禁止拷贝
-    SPSCVarQueueOPT(const SPSCVarQueueOPT&) = delete;
-    SPSCVarQueueOPT& operator=(const SPSCVarQueueOPT&) = delete;
+    SPSCVarQueueStack(const SPSCVarQueueStack&) = delete;
+    SPSCVarQueueStack& operator=(const SPSCVarQueueStack&) = delete;
 
     /**
      * @brief 生产者分配空间
