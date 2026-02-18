@@ -26,9 +26,7 @@ enum class LogLevel : uint8_t { INFO,
                                 CRIT };
 
 // 配置参数
-// 1. 每个线程的 SPSC 队列大小 (8MB)，足够大以应对突发流量, 16MB MSVC无法运行
-constexpr uint32_t THREAD_QUEUE_SIZE = 8 * 1024 * 1024;
-// 2. 单条日志最大长度 (栈上缓存大小)
+// 单条日志最大长度 (栈上缓存大小)
 constexpr size_t MAX_LOG_LINE_SIZE = 512;
 
 // 辅助函数：获取文件名
@@ -451,8 +449,39 @@ class SPSCVarQueueHeap {
 }  // namespace
 
 // --- 核心：TLS + SPSC ---
-class NanoLogger;
 using TLSSPSCQueue = SPSCVarQueueHeap;
+class NanoLogger {
+   public:
+    // 构造与析构
+    NanoLogger(std::string dir, std::string name, uint32_t roll_mb, uint32_t max_files);
+    NanoLogger();
+    ~NanoLogger();
+
+    // 禁止拷贝（典型的单例或资源管理类做法）
+    NanoLogger(const NanoLogger &) = delete;
+    NanoLogger &operator=(const NanoLogger &) = delete;
+
+    // 业务接口
+    void register_buf(std::shared_ptr<TLSSPSCQueue> q);
+    void unregister_buf(const std::shared_ptr<TLSSPSCQueue> &q);
+    void notify_work();
+
+   private:
+    enum class State { INIT,
+                       READY,
+                       SHUTDOWN };
+    void worker();
+    void poll(bool drain);
+
+    // 成员变量
+    std::atomic<State> m_state;
+    FileWriter m_writer;
+    std::thread m_thread;
+    std::mutex m_mutex;
+    std::vector<std::shared_ptr<TLSSPSCQueue>> m_queues;
+    std::atomic<bool> has_work{false};
+};
+
 inline std::atomic<NanoLogger *> atomic_logger{nullptr};
 // 全局配置变量
 inline std::atomic<uint32_t> g_thread_queue_size{16 * 1024 * 1024};  // 默认值16MB on heap
@@ -463,18 +492,30 @@ class ThreadBuffer {
         uint32_t size = g_thread_queue_size.load(std::memory_order_relaxed);
         m_queue = std::make_shared<TLSSPSCQueue>(size);
     }
-    ~ThreadBuffer();  // 见下方 NanoLogger 定义后的实现
+    ~ThreadBuffer() {
+        auto *logger = atomic_logger.load(std::memory_order_acquire);
+        if (logger) {
+            logger->unregister_buf(m_queue);
+        }
+    }
 
     // Non-blocking push
     void push(const NanoLogLine &logline) {
         if (!m_queue) return;
         size_t len = logline.bytes_used();
         // SPSC alloc 失败返回 nullptr，即队列满直接丢弃 (NonGuaranteed)
-        m_queue->tryPush(static_cast<uint16_t>(len), [&](TLSSPSCQueue::MsgHeader *header) {
+        bool pushed = m_queue->tryPush(static_cast<uint16_t>(len), [&](TLSSPSCQueue::MsgHeader *header) {
             // SPSC MsgHeader 之后是数据区
             char *dest = reinterpret_cast<char *>(header) + sizeof(TLSSPSCQueue::MsgHeader);
             std::memcpy(dest, logline.buffer(), len);
         });
+
+        if (pushed) {  // 成功放入队列
+            auto *logger = atomic_logger.load(std::memory_order_acquire);
+            if (logger) {
+                logger->notify_work();
+            }
+        }
     }
 
     auto get_queue() { return m_queue; }
@@ -483,88 +524,82 @@ class ThreadBuffer {
     std::shared_ptr<TLSSPSCQueue> m_queue;
 };
 
-class NanoLogger {
-   public:
-    NanoLogger(std::string dir, std::string name, uint32_t roll_mb, uint32_t max_files)
-        : m_state(State::INIT), m_writer(dir, name, roll_mb, max_files), m_thread(&NanoLogger::worker, this) {
-        m_state.store(State::READY, std::memory_order_release);
+inline NanoLogger::NanoLogger(std::string dir, std::string name, uint32_t roll_mb, uint32_t max_files)
+    : m_state(State::INIT),
+      m_writer(dir, name, roll_mb, max_files),
+      m_thread(&NanoLogger::worker, this) {
+    m_state.store(State::READY, std::memory_order_release);
+}
+
+inline NanoLogger::NanoLogger()
+    : m_state(State::INIT),
+      m_thread(&NanoLogger::worker, this) {
+    m_state.store(State::READY, std::memory_order_release);
+}
+
+inline NanoLogger::~NanoLogger() {
+    m_state.store(State::SHUTDOWN, std::memory_order_release);
+    has_work.store(true, std::memory_order_relaxed);
+    has_work.notify_one();  // 确保唤醒以退出
+    if (m_thread.joinable()) m_thread.join();
+    // 线程停止后再置空全局指针，防止新线程在此时注册
+    atomic_logger.store(nullptr, std::memory_order_release);
+}
+
+inline void NanoLogger::register_buf(std::shared_ptr<TLSSPSCQueue> q) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_queues.push_back(std::move(q));
+}
+
+inline void NanoLogger::unregister_buf(const std::shared_ptr<TLSSPSCQueue> &q) {
+    // 这一块可以不实现
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::erase(m_queues, q);
+}
+
+// 在生产者 push 成功后调用（例如 ThreadBuffer::push 里）
+inline void NanoLogger::notify_work() {
+    // 只在从 false → true 时才 notify（减少 notify 次数）
+    if (!has_work.exchange(true, std::memory_order_release)) {
+        has_work.notify_one();
     }
-    NanoLogger()
-        : m_state(State::INIT), m_thread(&NanoLogger::worker, this) {
-        m_state.store(State::READY, std::memory_order_release);
-    }
-    ~NanoLogger() {
-        m_state.store(State::SHUTDOWN);
-        if (m_thread.joinable()) m_thread.join();
-        // 线程停止后再置空全局指针，防止新线程在此时注册
-        atomic_logger.store(nullptr, std::memory_order_release);
+}
+
+inline void NanoLogger::worker() {
+    while (m_state.load(std::memory_order_acquire) == State::INIT) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 
-    void register_buf(std::shared_ptr<TLSSPSCQueue> q) {
+    while (m_state.load(std::memory_order_acquire) == State::READY) {
+        // 等待有工作（或状态变化）
+        has_work.wait(false, std::memory_order_acquire);
+        // 被唤醒后，重置标志（防止重复无谓唤醒）
+        has_work.store(false, std::memory_order_relaxed);
+        poll(false);
+    }
+    poll(true);  // 退出前 Drain
+}
+
+inline void NanoLogger::poll(bool drain) {
+    std::vector<std::shared_ptr<TLSSPSCQueue>> snapshot;
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_queues.push_back(std::move(q));
+        snapshot = m_queues;  // 拷贝 shared_ptr 增加引用计数，确保内存安全
     }
 
-    void unregister_buf(const std::shared_ptr<TLSSPSCQueue> &q) {
-        // 这一块可以不实现
-        std::lock_guard<std::mutex> lock(m_mutex);
-        // 使用 std::erase 移除对应的 shared_ptr
-        // 即使移除了，正在执行 poll 的线程因为 snapshot 持有引用，依然安全
-        std::erase(m_queues, q);
-    }
-
-   private:
-    void worker() {
-        while (m_state.load(std::memory_order_acquire) == State::INIT)
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-
-        while (m_state.load() == State::READY) poll(false);
-        // 退出前循环排空，直到没有任何数据
-        bool has_more = true;
-        while (has_more) {
-            has_more = poll(true);
+    bool did_work = false;
+    for (auto &q : snapshot) {
+        // 这里的 TLSSPSCQueue 内部逻辑实现细节
+        while (auto *header = q->front()) {
+            did_work = true;
+            char *data = reinterpret_cast<char *>(header) + sizeof(TLSSPSCQueue::MsgHeader);
+            m_writer.write(data, header->size - sizeof(TLSSPSCQueue::MsgHeader));
+            q->pop();
         }
     }
 
-    // 修改 poll 返回值，告知是否还有数据
-    bool poll(bool drain) {
-        bool active = false;
-        // 复制快照以减小锁粒度
-        std::vector<std::shared_ptr<TLSSPSCQueue>> snapshot;
-
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            snapshot = m_queues;  // 拷贝 shared_ptr 增加引用计数，确保内存安全
-        }
-
-        for (auto &q : snapshot) {
-            while (auto *header = q->front()) {
-                active = true;
-                char *data = reinterpret_cast<char *>(header) + sizeof(TLSSPSCQueue::MsgHeader);
-                m_writer.write(data, header->size - sizeof(TLSSPSCQueue::MsgHeader));
-                q->pop();
-            }
-        }
-        if (!active && !drain) std::this_thread::yield();
-        return active;  // 如果 active 为 true，说明还没排空
-    }
-
-    enum class State { INIT,
-                       READY,
-                       SHUTDOWN };
-    std::atomic<State> m_state;
-    FileWriter m_writer;
-    std::thread m_thread;
-    std::mutex m_mutex;
-    std::vector<std::shared_ptr<TLSSPSCQueue>> m_queues;
-};
-
-// --- 延迟实现的 ThreadBuffer 析构函数 ---
-inline ThreadBuffer::~ThreadBuffer() {
-    auto *logger = atomic_logger.load(std::memory_order_acquire);
-    if (logger) {
-        logger->unregister_buf(m_queue);
-    }
+    // 如果 drain 模式且还有工作，可以继续循环（但通常一次就够）
+    if (drain && did_work) poll(true);
 }
 
 // --- 对外 API 接口 ---
